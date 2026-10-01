@@ -10,6 +10,7 @@ import {HookFlags} from "../src/HookFlags.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {CustomRevert} from "v4-core/src/libraries/CustomRevert.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
@@ -261,6 +262,52 @@ abstract contract HookTests is HookFixture {
             _check(true, true, 10 ether);
             _check(false, false, 10 ether);
         }
+    }
+
+    function test_dynamicTokenPoolRejectedBeforeInitialization() public {
+        key.fee = LPFeeLibrary.DYNAMIC_FEE_FLAG;
+        vm.prank(address(0xBEEF));
+        vm.expectRevert(_wrapped(IHooks.beforeInitialize.selector, BurnTaxHook.UnsupportedFee.selector));
+        manager.initialize(key, PRICE);
+        (uint160 price,,,) = IPoolManager(manager).getSlot0(key.toId());
+        assertEq(price, 0);
+    }
+
+    function test_otherStaticFeeStillAcceptedAndUnchanged() public {
+        key.fee = 1234;
+        referenceKey.fee = 1234;
+        manager.initialize(key, PRICE);
+        manager.initialize(referenceKey, PRICE);
+        router.modify(key, ModifyLiquidityParams(-600, 600, 1e24, bytes32(0)));
+        router.modify(referenceKey, ModifyLiquidityParams(-600, 600, 1e24, bytes32(0)));
+        _check(false, true, 10 ether);
+    }
+
+    function test_dynamicPoolWithoutTokenRemainsUnaffected() public {
+        MockERC20 other = new MockERC20("Other", "O", 1e30);
+        other.approve(address(router), 1e30);
+        (address first, address second) = address(other) < address(quote)
+            ? (address(other), address(quote))
+            : (address(quote), address(other));
+        PoolKey memory unrelated = PoolKey(
+            Currency.wrap(first),
+            Currency.wrap(second),
+            LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            60,
+            IHooks(address(hook))
+        );
+        manager.initialize(unrelated, PRICE);
+        router.modify(unrelated, ModifyLiquidityParams(-600, 600, 1e24, bytes32(0)));
+        vm.recordLogs();
+        router.swap(unrelated, _params(true, true, 10 ether), 0, type(uint128).max, 0);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint256 i; i < logs.length; ++i) {
+            assertNotEq(logs[i].emitter, address(hook));
+        }
+        (,,, uint24 lpFee) = IPoolManager(manager).getSlot0(unrelated.toId());
+        assertEq(lpFee, 0);
+        assertEq(token.balanceOf(DEAD), 0);
+        _assertSettled();
     }
 
     function test_poolWithoutTokenIsUnaffectedInAllModes() public {

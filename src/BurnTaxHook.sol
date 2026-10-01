@@ -5,6 +5,8 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
@@ -26,11 +28,12 @@ contract BurnTaxHook {
     error ZeroAddress();
     error OnlyPoolManager();
     error WrongHook();
+    error UnsupportedFee();
     error PartialFillOnSpecifiedToken();
     error SpecifiedAmountTooLarge();
 
     /// @param isBuy True when the trader receives BTAX; independent of currency ordering.
-    /// @param amount BTAX minor units sent to DEAD (including zero for a rounded-down tax).
+    /// @param amount BTAX minor units sent to DEAD as tokens or irrevocable ERC-6909 claims.
     event Burned(PoolId indexed poolId, bool indexed isBuy, uint256 amount);
 
     constructor(IPoolManager manager_, address token_) {
@@ -60,6 +63,8 @@ contract BurnTaxHook {
         returns (bytes4)
     {
         if (address(key.hooks) != address(this)) revert WrongHook();
+        // There is no fee updater; a dynamic BTAX pool would stay at a zero LP fee forever.
+        if (_containsToken(key) && LPFeeLibrary.isDynamicFee(key.fee)) revert UnsupportedFee();
         return IHooks.beforeInitialize.selector;
     }
 
@@ -110,10 +115,21 @@ contract BurnTaxHook {
             fee = isBuy ? uint256(tokenDelta) / 100 : uint256(-tokenDelta) / 99;
         }
 
-        // take debits the hook; the positive return delta credits it by exactly the same amount.
-        // Only BTAX is transferred. There is no native-ETH fee or retained hook balance.
+        // Both take and mint debit the hook; the return delta credits the same fee.
+        // A sell's input may not be settled yet. Claims to DEAD need no prefunding, cannot
+        // be redeemed by this hook, and avoid changing balances during an open BTAX sync.
         emit Burned(key.toId(), isBuy, fee);
-        if (fee != 0) poolManager.take(Currency.wrap(launchedToken), DEAD, fee);
+        if (fee != 0) {
+            Currency currency = Currency.wrap(launchedToken);
+            if (
+                TransientStateLibrary.getSyncedCurrency(poolManager) == currency
+                    || currency.balanceOf(address(poolManager)) < fee
+            ) {
+                poolManager.mint(DEAD, currency.toId(), fee);
+            } else {
+                poolManager.take(currency, DEAD, fee);
+            }
+        }
         return (IHooks.afterSwap.selector, specified ? int128(0) : fee.toInt128());
     }
 
