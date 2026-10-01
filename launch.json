@@ -1,0 +1,30 @@
+{
+  "kind": "univ4_hook",
+  "hook": {
+    "contract": "BurnTaxHook",
+    "constructorArgs": [
+      "$poolManager",
+      "0x0000000000000000000000000000000000000001"
+    ],
+    "permissions": [
+      "beforeInitialize",
+      "beforeSwap",
+      "afterSwap",
+      "beforeSwapReturnDelta",
+      "afterSwapReturnDelta"
+    ]
+  },
+  "token": {
+    "contract": "BurnTaxToken",
+    "name": "BurnTax",
+    "symbol": "BTAX",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "BLOCKING deployment binding: constructorArgs[1] is an explicit nonzero sentinel, 0x0000000000000000000000000000000000000001, not a verified BurnTaxToken address. The repository supplies no deployed or deterministically predicted launch-token address. Do not deploy this manifest as written: replace that literal with the verified address of the launched BurnTaxToken, then repeat review and hook salt mining. The manifest supports no $token substitution; notes do not authorize substitution. Constructor order is (IPoolManager manager_, address token_); only $poolManager is resolved by the deployer. Both arguments become immutable. BurnTaxToken has no constructor arguments.\n\nIntended pool: native ETH as currency0 and the launched BTAX token as currency1, using BurnTaxHook, a 3000 (0.3%) LP fee and tick spacing 60. Initial sqrtPriceX96 is 2^96, matching the repository fixtures: a 1:1 BTAX/ETH ratio in base units, also 1 BTAX per ETH with 18 decimals. This is an explicit fixture-based initial-price assumption, not an observed market price. The hook accepts all three listed fee tiers and never overrides the pool's LP fee.\n\nFor every successful swap containing its configured token, the hook sends floor(gross BTAX leg / 100) to 0x000000000000000000000000000000000000dEaD. Buys receive BTAX and sells pay BTAX regardless of currency ordering. Exact-input buys deduct floor(AMM token output / 100); exact-input sells reserve floor(specified token input / 100). Exact-output buys request net token output plus floor(net / 99), burning the latter; exact-output sells add floor(AMM token input / 99) to the trader's token payment. Positive return deltas charge the trader and balance the hook's immediate PoolManager.take. Burned(bytes32 indexed poolId, bool indexed isBuy, uint256 amount) reports the actual transfer, including zero after rounding. Unrelated pools return zero deltas and emit no burn event.\n\nLimits: exact-input sells and exact-output buys revert on partial fills; the other two modes tax executed volume. PoolManager must already hold sufficient BTAX for the immediate transfer; otherwise sells require router pre-settlement or revert atomically. No native ETH fee, deferred claims or redemption path exists. Very small trades can round to zero tax. Transfers, liquidity operations and pools using another hook are untaxed. Transfers to DEAD do not reduce totalSupply. The token has fixed supply and no further mint path. Neither contract has an owner, admin, upgrade or withdrawal path; the 1% cannot change. Standard ERC-20 behavior and a Cancun-compatible chain are required.\n\nAll five declared permissions match getHookPermissions; all other permissions are false. Every enabled callback authenticates PoolManager and verifies the hook address in the pool key. Mine the deployed hook address for low-14-bit flags 0x20cc (8396) using the final constructor arguments, and initialize the pool atomically with deployment. Existing tests use real PoolManagers and cover all four swap modes, both token orderings, events, DEAD balances, unrelated pools, supported LP fees, fresh managers, fuzzing and settlement invariants. README.md documents the rule and integration limits. This technical manifest does not set launch-policy supply or allocations or establish deployment approval."
+}
