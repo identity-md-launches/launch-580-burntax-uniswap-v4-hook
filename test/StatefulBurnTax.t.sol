@@ -7,6 +7,8 @@ import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {HookFixture} from "./helpers/HookFixture.sol";
 import {BurnAssertions} from "./helpers/BurnAssertions.sol";
 import {PoolRouter} from "./helpers/PoolRouter.sol";
+import {OpenSyncRouter} from "./Settlement.t.sol";
+import {BurnTaxHook} from "src/BurnTaxHook.sol";
 import {BurnTaxToken} from "src/BurnTaxToken.sol";
 import {MockERC20} from "./mocks/MockERC20.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
@@ -27,6 +29,7 @@ contract BurnTaxSequenceHandler is BurnAssertions {
     address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
     uint256 public constant INITIAL_BALANCE = 1e24;
     PoolRouter public immutable router;
+    OpenSyncRouter public immutable openRouter;
     BurnTaxToken public immutable token;
     MockERC20 public immutable quote;
     IPoolManager public immutable manager;
@@ -44,12 +47,16 @@ contract BurnTaxSequenceHandler is BurnAssertions {
     uint256 public liquidityCalls;
     uint256 public transfers;
     uint256 public rejectedMintCalls;
+    uint256 public deferredTrades;
+    uint256 public rejectedDeferredTrades;
+    uint256 public finalizations;
 
     constructor(PoolRouter router_, BurnTaxToken token_, MockERC20 quote_, PoolKey memory key_) {
         router = router_;
         token = token_;
         quote = quote_;
         manager = router_.manager();
+        openRouter = new OpenSyncRouter(manager);
         key = key_;
         tokenIs0 = Currency.unwrap(key_.currency0) == address(token_);
         for (uint256 i; i < 3; ++i) {
@@ -58,6 +65,7 @@ contract BurnTaxSequenceHandler is BurnAssertions {
             expectedQuote[i] = int256(INITIAL_BALANCE);
             vm.startPrank(actors[i]);
             token_.approve(address(router_), type(uint256).max);
+            token_.approve(address(openRouter), type(uint256).max);
             quote_.approve(address(router_), type(uint256).max);
             vm.stopPrank();
         }
@@ -155,6 +163,60 @@ contract BurnTaxSequenceHandler is BurnAssertions {
         ++rejectedMintCalls;
     }
 
+    function deferredSell(uint256 actorSeed, uint256 amountSeed, bool twice) external {
+        uint256 i = actorSeed % 3;
+        uint256 amount = bound(amountSeed, 1, 1e20);
+        uint256 beforeBurn = token.balanceOf(DEAD);
+        vm.recordLogs();
+        vm.prank(actors[i]);
+        BalanceDelta delta = openRouter.swapWithMode(
+            key,
+            _params(false, true, amount),
+            twice ? OpenSyncRouter.Mode.Twice : OpenSyncRouter.Mode.Complete,
+            1
+        );
+        uint256 burned = _assertSwapLogs(
+            vm.getRecordedLogs(), key, address(manager), address(openRouter), tokenIs0, false, delta
+        );
+        assertEq(token.balanceOf(DEAD) - beforeBurn, burned, "deferred tax delivered before unlock returns");
+        assertEq(_tokenDelta(delta), -int256(amount), "deferred settlement preserves exact input");
+        expectedBurn += burned;
+        _account(i, delta);
+        ++deferredTrades;
+    }
+
+    function rejectedDeferredSell(uint256 actorSeed, uint256 amountSeed, bool settleEarly) external {
+        uint256 i = actorSeed % 3;
+        // A positive tax is required to leave a credit that must be completed.
+        uint256 amount = bound(amountSeed, 100, 1e20);
+        bytes32 beforeState = _stateDigest(i);
+        vm.prank(actors[i]);
+        vm.expectRevert(
+            settleEarly ? BurnTaxHook.OpenTokenSync.selector : IPoolManager.CurrencyNotSettled.selector
+        );
+        openRouter.swapWithMode(
+            key,
+            _params(false, true, amount),
+            settleEarly ? OpenSyncRouter.Mode.BeforeSettle : OpenSyncRouter.Mode.Omit,
+            1
+        );
+        assertEq(_stateDigest(i), beforeState, "failed deferred settlement must roll back the swap");
+        ++rejectedDeferredTrades;
+    }
+
+    function finalizeAgain(uint256 actorSeed) external {
+        uint256 i = actorSeed % 3;
+        bytes32 beforeState = _stateDigest(i);
+        vm.recordLogs();
+        vm.startPrank(actors[i]);
+        BurnTaxHook(address(key.hooks)).settleBurn();
+        BurnTaxHook(address(key.hooks)).settleBurn();
+        vm.stopPrank();
+        assertEq(vm.getRecordedLogs().length, 0, "completed burns cannot emit or transfer again");
+        assertEq(_stateDigest(i), beforeState, "idle finalization cannot consume donations or replay a burn");
+        ++finalizations;
+    }
+
     function _trade(uint256 i, uint256 amount, bool buy, bool exactInput, bool prefund) internal {
         uint256 beforeBurn = token.balanceOf(DEAD);
         vm.recordLogs();
@@ -204,9 +266,21 @@ contract BurnTaxSequenceHandler is BurnAssertions {
         (uint256 growth0, uint256 growth1) = manager.getFeeGrowthGlobals(key.toId());
         bytes32 poolState =
             keccak256(abi.encode(price, tick, growth0, growth1, manager.getLiquidity(key.toId())));
+        bytes32 settlementState = keccak256(
+            abi.encode(
+                token.balanceOf(address(key.hooks)),
+                token.balanceOf(address(openRouter)),
+                quote.balanceOf(address(openRouter)),
+                manager.currencyDelta(address(key.hooks), key.currency0),
+                manager.currencyDelta(address(key.hooks), key.currency1),
+                manager.currencyDelta(address(openRouter), key.currency0),
+                manager.currencyDelta(address(openRouter), key.currency1)
+            )
+        );
         return keccak256(
             abi.encode(
                 poolState,
+                settlementState,
                 token.balanceOf(actors[i]),
                 quote.balanceOf(actors[i]),
                 token.balanceOf(address(manager)),
@@ -231,13 +305,16 @@ abstract contract StatefulBurnTaxTests is HookFixture {
             token.transfer(handler.actors(i), handler.INITIAL_BALANCE());
             quote.transfer(handler.actors(i), handler.INITIAL_BALANCE());
         }
-        bytes4[] memory selectors = new bytes4[](6);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = handler.trade.selector;
         selectors[1] = handler.roundTrip.selector;
         selectors[2] = handler.transferOrDonate.selector;
         selectors[3] = handler.changeLiquidity.selector;
         selectors[4] = handler.rejectedTrade.selector;
         selectors[5] = handler.forbiddenMint.selector;
+        selectors[6] = handler.deferredSell.selector;
+        selectors[7] = handler.rejectedDeferredSell.selector;
+        selectors[8] = handler.finalizeAgain.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
         targetContract(address(handler));
     }
@@ -284,6 +361,8 @@ abstract contract StatefulBurnTaxTests is HookFixture {
         assertEq(fee, 3000);
         assertEq(token.balanceOf(address(router)), 0);
         assertEq(quote.balanceOf(address(router)), 0);
+        assertEq(token.balanceOf(address(handler.openRouter())), 0);
+        assertEq(quote.balanceOf(address(handler.openRouter())), 0);
         assertEq(quote.balanceOf(address(hook)), 0);
         assertEq(manager.balanceOf(address(hook), uint160(address(token))), 0);
         assertEq(manager.balanceOf(DEAD, uint160(address(token))), 0);
@@ -291,6 +370,8 @@ abstract contract StatefulBurnTaxTests is HookFixture {
         assertEq(IPoolManager(manager).currencyDelta(address(hook), key.currency1), 0);
         assertEq(IPoolManager(manager).currencyDelta(address(router), key.currency0), 0);
         assertEq(IPoolManager(manager).currencyDelta(address(router), key.currency1), 0);
+        assertEq(IPoolManager(manager).currencyDelta(address(handler.openRouter()), key.currency0), 0);
+        assertEq(IPoolManager(manager).currencyDelta(address(handler.openRouter()), key.currency1), 0);
     }
 
     // End every campaign by exiting all generated LP positions. A view-only liquidity check
@@ -317,6 +398,12 @@ abstract contract StatefulBurnTaxTests is HookFixture {
             handler.rejectedTrade(i, 1 ether, true);
             handler.rejectedTrade(i, 1 ether, false);
             handler.forbiddenMint(i, type(uint256).max);
+            handler.deferredSell(i, 1 ether, false);
+            handler.deferredSell(i, 1 ether, true);
+            handler.deferredSell(i, 99, true);
+            handler.rejectedDeferredSell(i, 1 ether, false);
+            handler.rejectedDeferredSell(i, 1 ether, true);
+            handler.finalizeAgain(i);
         }
         afterInvariant();
         assertEq(handler.trades(), 18);
@@ -324,6 +411,9 @@ abstract contract StatefulBurnTaxTests is HookFixture {
         assertEq(handler.failedTrades(), 6);
         assertEq(handler.transfers(), 9);
         assertEq(handler.rejectedMintCalls(), 3);
+        assertEq(handler.deferredTrades(), 9);
+        assertEq(handler.rejectedDeferredTrades(), 6);
+        assertEq(handler.finalizations(), 3);
         assertGt(handler.expectedBurn(), 0);
     }
 }

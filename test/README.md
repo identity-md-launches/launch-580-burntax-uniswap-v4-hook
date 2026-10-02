@@ -52,13 +52,28 @@ The stateful properties check:
 - Unchanged LP fee and position liquidity matching the handler's ledger.
 - Successful full withdrawal of every generated LP position after each campaign.
 
-A deterministic reachability test drives all six handler entry points, every
+The revised campaign also mixes deferred exact-input sells with these existing
+actions. It leaves BTAX synchronized across the swap, then checks delivery to
+DEAD after input settlement, including repeated completion. Attempts to omit
+completion or call it while BTAX is still synchronized must revert atomically.
+Random idle completion calls must preserve donations and cannot replay a burn.
+The existing independent balance ledgers and event oracle cover these new actions;
+both settlement routers must finish with zero balances and currency deltas.
+
+A deterministic reachability test drives all nine handler entry points, every
 trade mode, all actors, and every donation destination. Expected reverts are
 checked inside the handler; unexpected reverts fail the invariant campaign.
 Run counts are inline on the concrete test contracts so they apply to inherited
 test functions without editing `foundry.toml`.
 
-## Limits and reported discrepancy
+`DeferredBurnProperties.t.sol` checks an open BTAX sync across all four modes in
+both currency orderings, including buys where BTAX is the output. It verifies
+the interim hook credit against the manager's swap event, confirms that closing
+the sync credits zero payment, and requires actual token delivery exactly once
+before unlock returns. Each ordering runs 1,000 fuzz cases, deterministic minor-unit
+rounding boundaries, and rollback checks when completion is omitted in each mode.
+
+## Limits and settlement requirements
 
 - The suite uses actual vendored Uniswap v4 `PoolManager` bytecode, mined CREATE2
   hooks, the production token, and a standard mock quote token. No RPC, fork,
@@ -71,23 +86,22 @@ test functions without editing `foundry.toml`.
 - The implementation rejects partial fills when BTAX is the specified currency
   (exact-input sells and exact-output buys). The accepted tests document this
   restriction. Quote-specified trades tax only the executed amount.
-- **Reported medium finding:** if the manager lacks BTAX before settlement, or
-  a BTAX sync is open, the hook assigns ERC-6909 claims to DEAD instead of sending
-  BTAX there. Those claims lock backing value, but DEAD's ERC-20 balance does not
-  receive the promised tax. There is no redemption path that subsequently sends
-  that BTAX to DEAD. The inherited README and tests describe/accept this alternative;
-  this contribution reports the mismatch with the assignment instead of adding
-  new tests that treat it as the requested token transfer.
-- The independently runnable failing test is embedded in the root
-  `.imd-findings.json` report. On a fresh ETH-only position, a successful sale of
-  `1e18` BTAX delivers `0` to DEAD instead of `1e16`. It was run and failed on the
-  unmodified implementation. Its source stays outside the passing delivered
-  `.t.sol` files. Restore the report's `proof` as
-  `test/scratch/DeadBalanceProof.t.sol` and run `forge test --match-path` on that
-  path to reproduce. Scratch files are removed by the verifier.
-- The new stateful campaign covers the funded, closed-sync transfer path.
-  Underfunded and open-sync paths are covered by the inherited examples and the
-  reported failing proof; passing these invariants does not resolve that finding.
+- The earlier DEAD-balance finding is resolved in the current implementation.
+  `FreshManager.t.sol` verifies that selling `1e18` BTAX into a fresh ETH-only
+  position now sends `1e16` actual BTAX to DEAD. The hook no longer substitutes
+  ERC-6909 claims for token delivery; the suite requires zero claims for DEAD
+  and the hook.
+- If the manager lacks BTAX before input settlement or a BTAX sync is open,
+  delivery is deferred as a positive hook currency delta. The router must close
+  that sync, settle input, and call `settleBurn()` inside the same unlock.
+  Omitting completion reverts with `CurrencyNotSettled`; premature completion
+  with outstanding credit reverts with `OpenTokenSync`. Generic routers that
+  omit this integration cannot execute deferred burns. Repeated completion
+  neither pays the caller nor charges the trader twice.
+- Fresh-manager reserve exhaustion is covered by deterministic regressions.
+  Random sequences cover funded immediate and open-sync deferred settlement;
+  their bounded trades do not exhaust the base position. Local passing results
+  do not establish production-router compatibility or a live-chain rehearsal.
 
 ## Verification
 
@@ -102,6 +116,7 @@ The output/cache flags keep generated files inside the assignment's scratch
 directory; they do not alter compilation or test semantics. Plain `forge build`
 and `forge test` work with the existing project settings as well.
 
-Implementation reviewed: `97d845ba4955869dfdd3e0109b4c50f025daff6f`.
-Local tooling: Foundry 1.7.1, Solidity 0.8.26, Cancun EVM. No source contract,
-configuration, vendored dependency, or existing accepted test was changed.
+Local tooling: Foundry 1.8.3, Solidity 0.8.26, Cancun EVM. This revision extends
+the accepted stateful suite, adds deferred-settlement properties, and corrects
+the obsolete finding description. No source contract, configuration, or vendored
+dependency is changed.
