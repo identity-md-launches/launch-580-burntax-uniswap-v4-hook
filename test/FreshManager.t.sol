@@ -5,7 +5,6 @@ import {HookFixture} from "./helpers/HookFixture.sol";
 import {PoolRouter} from "./helpers/PoolRouter.sol";
 import {BurnTaxToken} from "../src/BurnTaxToken.sol";
 import {Vm} from "forge-std/Vm.sol";
-import {stdError} from "forge-std/StdError.sol";
 import {IERC20Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {PoolManager} from "v4-core/src/PoolManager.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
@@ -57,6 +56,7 @@ contract FreshManagerTest is HookFixture {
         assertEq(delta.amount0(), -1 ether);
         assertEq(address(manager).balance, 1 ether);
         assertEq(address(DEAD).balance, 0);
+        _assertSettled();
     }
 
     function test_firstBuyExactOutputOnTokenOnlyFreshManager() public {
@@ -66,29 +66,30 @@ contract FreshManagerTest is HookFixture {
         assertEq(delta.amount1(), 1 ether);
         assertEq(token.balanceOf(DEAD), uint256(1 ether) / 99);
         assertEq(address(manager).balance, uint256(-int256(delta.amount0())));
+        _assertSettled();
     }
 
-    function test_sellExactInputWithoutReservesOrPrefundingCommitsBurn() public {
+    function test_sellExactInputWithoutReservesOrPrefundingDeliversBurn() public {
         _fresh(false);
-        _checkSell(true, true);
+        _checkSell(true);
     }
 
-    function test_sellExactOutputWithoutReservesOrPrefundingCommitsBurn() public {
+    function test_sellExactOutputWithoutReservesOrPrefundingDeliversBurn() public {
         _fresh(false);
-        _checkSell(false, true);
+        _checkSell(false);
     }
 
     function test_sellExactInputAfterBuyingOutLaunchRange() public {
         _buyOutRange();
-        _checkSell(true, true);
+        _checkSell(true);
         // Once the first seller settles, subsequent burns can again transfer directly.
-        _checkSell(true, false);
+        _checkSell(true);
     }
 
     function test_sellExactOutputAfterBuyingOutLaunchRange() public {
         _buyOutRange();
-        _checkSell(false, true);
-        _checkSell(false, false);
+        _checkSell(false);
+        _checkSell(false);
     }
 
     function _buyOutRange() internal {
@@ -98,23 +99,22 @@ contract FreshManagerTest is HookFixture {
         assertEq(token.balanceOf(address(manager)), 1);
     }
 
-    function test_balanceJustBelowFeeCommitsClaim() public {
+    function test_balanceJustBelowFeeDeliversBurnAfterSettlement() public {
         _fresh(false);
         token.transfer(address(manager), 0.01 ether - 1);
-        _checkSell(true, true);
+        _checkSell(true);
     }
 
     function test_balanceEqualToFeeTransfersDirectly() public {
         _fresh(false);
         token.transfer(address(manager), 0.01 ether);
-        _checkSell(true, false);
+        _checkSell(true);
     }
 
-    function _checkSell(bool exactInput, bool claims) internal {
+    function _checkSell(bool exactInput) internal {
         uint256 traderBefore = token.balanceOf(address(this));
         uint256 managerBefore = token.balanceOf(address(manager));
         uint256 deadBefore = token.balanceOf(DEAD);
-        uint256 claimBefore = manager.balanceOf(DEAD, uint160(address(token)));
         vm.recordLogs();
         BalanceDelta delta =
             router.swap(key, _params(false, exactInput, exactInput ? 1 ether : 0.1 ether), 0, 2 ether, 0);
@@ -125,9 +125,8 @@ contract FreshManagerTest is HookFixture {
         else assertEq(delta.amount0(), 0.1 ether);
         assertEq(uint256(-int256(delta.amount1())), paid);
         assertGt(delta.amount0(), 0);
-        assertEq(token.balanceOf(DEAD) - deadBefore, claims ? 0 : fee);
-        assertEq(manager.balanceOf(DEAD, uint160(address(token))) - claimBefore, claims ? fee : 0);
-        assertEq(token.balanceOf(address(manager)) - managerBefore, claims ? paid : paid - fee);
+        assertEq(token.balanceOf(DEAD) - deadBefore, fee);
+        assertEq(token.balanceOf(address(manager)) - managerBefore, paid - fee);
         _assertBurnEvent(vm.getRecordedLogs(), fee);
         _assertSettled();
         assertEq(
@@ -150,7 +149,7 @@ contract FreshManagerTest is HookFixture {
         assertEq(events, 1);
     }
 
-    function test_failedSettlementRollsBackClaimBurnAndPrice() public {
+    function test_failedSettlementRollsBackBurnAndPrice() public {
         _fresh(false);
         token.approve(address(router), 0);
         vm.expectPartialRevert(IERC20Errors.ERC20InsufficientAllowance.selector);
@@ -158,7 +157,7 @@ contract FreshManagerTest is HookFixture {
         _assertFailedSell();
     }
 
-    function test_slippageFailureRollsBackClaimBurnAndPrice() public {
+    function test_slippageFailureRollsBackBurnAndPrice() public {
         _fresh(false);
         vm.expectRevert(PoolRouter.Slippage.selector);
         router.swap(key, _params(false, true, 1 ether), 2 ether, 1 ether, 0);
@@ -175,19 +174,20 @@ contract FreshManagerTest is HookFixture {
         _assertSettled();
     }
 
-    function test_neitherDeployerNorHookCanTransferDeadClaims() public {
+    function test_neitherDeployerNorHookCanTransferDeliveredDeadTokens() public {
         _fresh(false);
-        _checkSell(true, true);
-        uint256 id = uint160(address(token));
-        vm.expectRevert(stdError.arithmeticError);
-        manager.transferFrom(DEAD, address(this), id, 1);
+        _checkSell(true);
+        vm.expectPartialRevert(IERC20Errors.ERC20InsufficientAllowance.selector);
+        token.transferFrom(DEAD, address(this), 1);
         vm.prank(address(hook));
-        vm.expectRevert(stdError.arithmeticError);
-        manager.transferFrom(DEAD, address(hook), id, 1);
-        assertEq(manager.balanceOf(DEAD, id), 0.01 ether);
+        vm.expectPartialRevert(IERC20Errors.ERC20InsufficientAllowance.selector);
+        token.transferFrom(DEAD, address(hook), 1);
+        assertEq(token.balanceOf(DEAD), 0.01 ether);
+        _assertSettled();
     }
 
     function _assertSettled() internal view {
+        assertEq(manager.balanceOf(DEAD, uint160(address(token))), 0);
         assertEq(manager.balanceOf(address(hook), uint160(address(token))), 0);
         assertEq(token.balanceOf(address(hook)), 0);
         assertEq(token.balanceOf(address(router)), 0);
@@ -208,6 +208,7 @@ contract FreshManagerTest is HookFixture {
         assertEq(token.balanceOf(DEAD), 0.01 ether);
         assertEq(token.balanceOf(address(manager)), 0.99 ether);
         assertEq(beforeToken - token.balanceOf(address(this)), 1 ether);
+        _assertSettled();
     }
 
     function test_sellExactOutputIntoQuoteOnlyPoolWithPrefunding() public {
@@ -220,6 +221,6 @@ contract FreshManagerTest is HookFixture {
         assertEq(uint256(-int256(delta.amount1())), paid);
         assertLt(paid, 2 ether);
         assertEq(token.balanceOf(address(manager)) + token.balanceOf(DEAD), paid);
-        assertEq(token.balanceOf(address(router)), 0);
+        _assertSettled();
     }
 }

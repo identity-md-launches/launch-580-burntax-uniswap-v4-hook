@@ -9,6 +9,7 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {SwapParams, ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
 import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {BurnTaxHook} from "../../src/BurnTaxHook.sol";
 
 /// @dev Test-only settlement router. Supports slippage checks and optional input pre-settlement.
 contract PoolRouter is IUnlockCallback {
@@ -88,6 +89,9 @@ contract PoolRouter is IUnlockCallback {
         }
         _settle(r.key.currency0, r.payer);
         _settle(r.key.currency1, r.payer);
+        if (!r.liquidity && address(r.key.hooks) != address(0)) {
+            BurnTaxHook(address(r.key.hooks)).settleBurn();
+        }
         return abi.encode(delta);
     }
 
